@@ -1,0 +1,59 @@
+MISSION CRITICAL EMAIL LLC — REPOSITORY LICENSE
+================================================
+
+This repository contains content under TWO different licenses.  Read this
+file carefully; the license that applies depends on which file you are using.
+
+
+1. THE OPERATOR SCRIPTS  —  MIT License
+---------------------------------------
+
+The following shell scripts are licensed under the MIT License (full text
+below).  You may use, copy, modify, and redistribute them under those terms:
+
+    MCE_OP1_imap_preflight.sh
+    MCE_OP2_broken_shares_checker.sh
+
+(Each script also carries the MIT License in its own header.)
+
+
+2. EVERYTHING ELSE  —  Copyright, all rights reserved
+-----------------------------------------------------
+
+All other content in this repository — including README.md and any other
+documentation, text, or files — is:
+
+    Copyright (c) 2026 Mission Critical Email LLC.  All rights reserved.
+
+No license is granted for the documentation.  It may not be copied, modified,
+redistributed, or republished, in whole or in part, in any medium, without
+the prior written permission of Mission Critical Email LLC.  It is provided
+to operators solely as reference for running the licensed Mission Critical
+Email migration software.
+
+The Mission Critical Email migration binary itself is a separately licensed,
+proprietary product and is NOT contained in this repository.
+
+
+--------------------------------------------------------------------------
+MIT License  (applies ONLY to the two operator scripts named in section 1)
+
+Copyright (c) 2026 Mission Critical Email LLC
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
