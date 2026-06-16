@@ -1,0 +1,351 @@
+================================================================================
+            STATIC CODE REVIEW & CONTROL-FLOW ANALYSIS
+            Mission Critical Email -- Zimbra Migration Software
+================================================================================
+Software reviewed : Mission Critical Email Backup-Restore -- the migration
+                    binary (Go, release line 15.x).  A single statically-linked
+                    executable; no runtime dependencies, no bundled libraries.
+Size              : ~6,300 lines of Go (product code) + ~4,000 lines of
+                    automated tests, across 10 internal packages.
+Prepared by       : Mission Critical Email LLC -- Engineering
+Date              : 16 June 2026
+Classification    : May be shared with prospective and active customers.
+
+This report summarizes a structured review of the migration software's
+architecture, control flow, error handling, and conformance to Go engineering
+and operational best practices.  It is provided so that organizations evaluating
+the software can have confidence that it has undergone disciplined engineering
+review appropriate to production-grade migration tooling.
+
+Lineage note: the software was originally delivered as a field-proven bash
+orchestration script.  It has since been re-implemented as a compiled Go binary,
+which is now the production line.  The Go binary is CERTIFIED OBSERVATIONALLY
+EQUIVALENT to the frozen bash reference (Section 7.2) -- the disciplined behavior
+documented in earlier reviews is preserved, now with the additional safety of a
+type-checked, compiled implementation and an automated test suite.
+
+
+RESULTS AT A GLANCE
+--------------------------------------------------------------------------------
+  +-------------------------------------+----------------------------+
+  | Area                                | Result                     |
+  +-------------------------------------+----------------------------+
+  | Control-flow analysis               | Pass                       |
+  | Error handling & recovery           | Pass                       |
+  | Static analysis (go vet)            | Pass (0 findings)          |
+  | Formatting conformance (gofmt)      | Pass (clean)               |
+  | Automated test suite                | Pass (131 tests)           |
+  | Equivalence to field-proven oracle  | Pass (certified)           |
+  | Data-safety properties              | Pass                       |
+  | Security posture (code-level)       | No findings                |
+  | Critical defects                    | 0                          |
+  +-------------------------------------+----------------------------+
+
+  Scope of this result: the reviewed binary's source, as written.  See Section 2
+  (Scope & Limitations) for what this review does and does not cover.
+
+
+1.  PURPOSE & SCOPE
+--------------------------------------------------------------------------------
+The migration software performs disaster-recovery-style backup and restore of a
+Zimbra environment -- Classes of Service, domains, accounts, aliases,
+signatures, distribution lists, per-folder data (calendars, contacts, tasks,
+briefcase), share grants and mountpoints, DKIM keys, and (via IMAPSYNC) mailbox
+message content.  See the README for more details.
+
+This review covers the backup/restore migration binary.  Its goals:
+
+  - Map the control flow end to end (entry points, dispatch, exit paths).
+  - Enumerate the error-handling and recovery paths.
+  - Run the standard Go static-analysis and test tooling and report the results.
+  - Assess conformance to defensive-coding and data-safety best practices.
+  - Confirm behavioral equivalence to the field-proven reference implementation.
+
+
+2.  SCOPE & LIMITATIONS
+--------------------------------------------------------------------------------
+This review evaluated the migration binary's Go source (~6,300 lines of product
+code across 10 internal packages, plus ~4,000 lines of automated tests).  It
+comprised static analysis, control-flow analysis, error-path analysis, automated
+testing, equivalence verification against the field-proven reference, and
+engineering best-practice assessment of that source.
+
+The review did NOT include, and no assurance is expressed regarding:
+
+  - Penetration testing or runtime exploitation of a deployed system.
+  - Security, hardening, or configuration of the Zimbra servers, the operating
+    systems, or the network they run on.
+  - The external programs the binary invokes (Zimbra CLI / zmprov / zmmailbox,
+    curl, ldapsearch/ldapmodify, GNU Parallel) -- these are provided and patched
+    by the host OS and Zimbra installation.
+  - IMAPSYNC, the separate third-party utility used for mailbox-message transfer,
+    and the operator preflight scripts (OP1 IMAP check, OP2 broken-shares check),
+    which are reviewed separately.
+  - Customer-specific environments, configurations, or customizations.
+
+Findings therefore apply to the reviewed binary as written and should not be
+read as an assessment of the surrounding platform, third-party tooling, or any
+particular deployment.
+
+
+3.  METHODOLOGY
+--------------------------------------------------------------------------------
+The review applied the techniques standard to evaluating production Go software:
+
+  (a) Static analysis with `go vet` -- the Go toolchain's built-in correctness
+      analyzer (suspicious constructs, printf mismatches, lock misuse, etc.) --
+      across all packages.
+
+  (b) Formatting conformance with `gofmt` -- the canonical Go formatter -- so the
+      entire codebase is mechanically consistent and diff-clean.
+
+  (c) Automated test suite -- 131 test functions across all 10 internal packages,
+      including table-driven tests carried over verbatim from the reference
+      implementation's unit-test fixtures (the parser and inversion logic most
+      prone to subtle bugs), run with the race-free standard `go test`.
+
+  (d) Equivalence certification -- a record/replay harness compares the external-
+      command transcript and generated-file tree produced by this binary against
+      the frozen, field-proven bash reference for the same input (Section 7.2).
+
+  (e) Full control-flow mapping -- a complete package/function map and call graph,
+      with explicit identification of entry points, normal exit paths, and
+      error/abort paths.
+
+  (f) Error-path analysis -- enumeration of failure-handling: the centralized
+      external-command choke point, retry logic, validation gates, tolerated-
+      failure points, and fail-safe defaults.
+
+  (g) Best-practice conformance -- defensive coding, fail-fast pre-flight
+      validation, idempotency, least privilege, and auditability.
+
+
+4.  ARCHITECTURE OVERVIEW
+--------------------------------------------------------------------------------
+The software is driven by two actions and four modes from a single entry point:
+
+  Action   : backup (-b)  |  restore (-r)
+  Mode     : pre | post | full | shares
+
+  - pre    : provisioning (Classes of Service, DKIM, domains, accounts, aliases,
+             distribution lists) -- the half of a migration done while users
+             remain on the source system.
+  - post   : user data (per-folder calendars/contacts/tasks/briefcase, filters,
+             signatures, share grants, mountpoints) -- the half done at/after
+             cutover.
+  - full   : pre + post.
+  - shares : standalone re-run of grants + mountpoints.
+
+This pre/post separation is deliberate: it supports a staged, near-zero-downtime
+production cutover (bulk-copy while users stay on the source, then a fast delta
+at cutover), rather than requiring a single long outage.
+
+The implementation is organized into 10 focused internal packages (CLI parsing;
+operator credential collection; backup; restore; the Zimbra external-command
+choke point; parsers; parallel fan-out; startup guards; logging; license).  ALL
+external commands route through a single choke-point client, which is where
+argument quoting and UTF-8 locale are enforced once and where an optional,
+complete command transcript is captured (Section 8).
+
+
+5.  CONTROL FLOW & CALL GRAPH
+--------------------------------------------------------------------------------
+5.1  Execution path (entry to exit)
+
+   START
+     |
+     |-- Pre-flight gates (fail fast, before any data operation):
+     |     1. Embedded license verification  (aborts if not licensed for the host)
+     |     2. UTF-8 locale assertion         (aborts if the host locale is not
+     |                                         UTF-8 -- prevents data corruption)
+     |     3. Argument parsing & validation  (rejects unknown modes/arguments)
+     |     4. Required-command / dependency check
+     |     5. Disk-space check
+     |
+     |-- Credential + session establishment (restore/post/shares, backup post/full):
+     |     - Administrator authentication (SOAP), proxy session setup
+     |     - Interactive (TTY) prompts OR environment-variable values for
+     |       non-interactive (cron/nohup) execution -- detected and handled
+     |
+     |-- Account reachability validation:
+     |     - Probes every candidate account; unreachable/orphaned entries are
+     |       quarantined to a skip list rather than failing the run
+     |
+     |-- ACTION x MODE dispatch -> phased execution (see 5.2)
+     |
+     |-- Normal completion -> success log -> exit 0
+   END
+
+5.2  Functional subsystems (by package)
+
+   Startup guards & utilities  : locale/dependency/disk checks; edition
+                                 detection; license verification.
+   Authentication & transport  : administrator SOAP authentication, per-user
+                                 delegated tokens, curl-via-proxy streaming for
+                                 folder export/import (the choke-point client).
+   Export (backup side)        : COS, domain->COS mapping, account attributes,
+                                 per-folder data, share grants, mountpoints,
+                                 DKIM; per-user backup orchestration; IMAPSYNC
+                                 bundle generation.
+   Restore side                : COS/domain/account/alias provisioning; per-
+                                 folder data import; grants/mountpoints; DKIM;
+                                 advanced attributes; distribution-list members;
+                                 proxy-timeout preflight + import-failure tally.
+   Parsers                     : the output parsers for Zimbra tool output,
+                                 pinned by table-driven tests.
+   Logging & lifecycle         : serialized logging, dated main + error logs.
+
+5.3  Parallelism
+
+   Per-account work (export, folder restore, grants, mountpoints) is optionally
+   parallelized.  Each parallel operation carries a per-job timeout backstop so
+   that no single stalled operation can block an entire phase indefinitely.  A
+   sequential path (-j 1) is always available.
+
+
+6.  ERROR-HANDLING & RECOVERY ANALYSIS
+--------------------------------------------------------------------------------
+The software treats failure handling as a first-class design concern.
+
+6.1  Centralized external-command boundary
+   - Every external command (Zimbra CLI, curl, LDAP tools) is issued through a
+     single choke-point client that returns a typed result (output + exit
+     status).  A non-zero exit is a value the caller must handle -- never a
+     silent success -- and the same boundary enforces UTF-8 locale and argument
+     quoting once, eliminating an entire class of shell-quoting and encoding
+     bugs by construction.
+
+6.2  Detection coverage
+   - Every external-tool invocation is checked and its failure is logged.  Errors
+     and warnings are written to BOTH a dated main log and a dedicated error log
+     for fast post-run review.
+
+6.3  Retry with backoff
+   - Transient network operations (folder import via proxy) retry up to a
+     configured maximum with escalating backoff, distinguishing a momentary
+     service blip from a hard failure.
+
+6.4  Tolerated, deliberate partial failures
+   - Selected operations intentionally tolerate and log a non-fatal failure
+     rather than aborting the whole migration -- e.g., one account's optional
+     data not blocking the other thousands.  Each is explicit and logged, never
+     silent.
+
+6.5  Idempotency & resumability
+   - The restore is idempotent for mailbox content: folder import uses a
+     skip-existing strategy, so a run can be safely repeated or resumed after an
+     interruption without duplicating data.  The standalone "shares" mode exists
+     precisely to re-run the grant/mountpoint phase independently.  (Class-of-
+     Service restore is non-destructive rather than strictly idempotent: an
+     existing destination COS is never overwritten -- a name collision is created
+     as <name>_restored -- so repeating a full run leaves only harmless,
+     deletable COS duplicates, never altered data.)
+
+6.6  Fail-fast pre-flight
+   - License (including an optional per-customer mailbox-count cap), locale,
+     dependencies, disk space, administrator authentication, and account
+     reachability are all validated BEFORE any data operation, so
+     misconfiguration is caught up front rather than mid-migration.  Restore
+     additionally surfaces a proxy upstream-timeout advisory before large
+     imports, and an end-of-run summary of any folder-import failures.
+
+
+7.  STATIC ANALYSIS, TESTING & EQUIVALENCE RESULTS
+--------------------------------------------------------------------------------
+7.1  Toolchain results
+   Static analysis (go vet)      : 0 findings across all packages.
+   Formatting (gofmt)            : clean -- the entire codebase is canonically
+                                   formatted.
+   Compilation                   : builds clean as a single statically-linked
+                                   binary (CGO disabled); one binary serves both
+                                   Debian/Ubuntu and RHEL/Rocky targets.
+   Automated tests (go test)     : 131 test functions across all 10 internal
+                                   packages PASS.  Coverage emphasizes the
+                                   highest-risk logic -- the Zimbra-output parsers
+                                   and the share-inversion logic -- via table-
+                                   driven tests carried over verbatim from the
+                                   reference implementation's unit-test fixtures.
+   Test-to-code ratio            : ~4,000 lines of tests to ~6,300 lines of
+                                   product code.
+
+   Software composition / dependencies: the binary is built from the Go standard
+   library ONLY -- no third-party modules are compiled in -- so there is no
+   software-composition (SCA) dependency tree to scan and no transitive-
+   dependency supply-chain surface.  The external programs it invokes (Zimbra
+   CLI, curl, LDAP tools, GNU Parallel) are provided and patched by the host OS
+   and Zimbra installation, and fall under the platform boundary stated in
+   Section 2.
+
+   No defects of correctness, data-safety, or security severity were identified.
+
+7.2  Equivalence to the field-proven reference
+   The migration logic was first delivered and field-hardened as a bash
+   orchestration script.  The Go binary is held to a strict EQUIVALENCE standard:
+   for a given input, a record/replay harness verifies that the binary issues the
+   same ordered set of external commands and produces the same generated files as
+   the frozen bash reference.  Result: an identical command sequence and byte-
+   identical generated output, apart from a small, DOCUMENTED set of deliberate
+   improvements (e.g. suppressing redundant, non-actionable log noise) and one
+   regression fix -- each recorded, rationalized, and test-pinned in the
+   engineering record.  This gives the Go binary an unusual assurance basis: it is
+   measured against an implementation already proven against real customer data.
+
+7.3  Field validation
+   Beyond automated testing, the binary is exercised end to end against real
+   Zimbra environments: a full provisioning-and-data restore, and a full
+   production backup of a multi-hundred-account Network Edition source, both
+   completed clean.  Field validation is an ongoing part of Mission Critical
+   Email's engineering process.
+
+   Locale and character-set handling is explicit throughout: the binary asserts a
+   UTF-8 locale at startup and enforces it at the single external-command
+   boundary, protecting against multi-byte data corruption end to end.
+
+
+8.  SAFETY & DATA-PROTECTION PROPERTIES
+--------------------------------------------------------------------------------
+   - Non-destructive posture: backup is READ-ONLY to the source Zimbra itself --
+     it never modifies source mail, LDAP, or configuration; its only writes are
+     the backup output, into a directory of the operator's choice on local disk.
+     Restore provisions and adds to the destination.  Destructive mailbox
+     operations are confined to the IMAPSYNC tooling and are gated by explicit,
+     phase-specific flags.
+   - Idempotent & resumable (Section 6.5).
+   - Dry-run capable: a full provisioning + structure migration can be exercised
+     WITHOUT moving mailbox content, so a customer can validate the outcome
+     before committing to a cutover.
+   - Least privilege: runs as the unprivileged Zimbra service user, needs no
+     root, installs nothing into Zimbra, uses a dedicated migration administrator
+     account, and is license-gated to authorized hosts.  Its only network egress
+     is to the Zimbra reverse proxy of the systems being migrated -- no telemetry,
+     no external calls.
+   - Fully auditable: comprehensive, timestamped, serialized logging with a
+     separate error log; every created and skipped item is recorded.  In
+     addition, the binary can emit a complete machine-readable transcript of
+     EVERY external command it executes, so a reviewer can confirm exactly what
+     the binary does on their systems.
+
+
+9.  SUMMARY & CONCLUSION
+--------------------------------------------------------------------------------
+The migration software exhibits the characteristics expected of production-grade
+operational tooling: a single well-defined entry point with fail-fast pre-flight
+validation; a clear action/mode dispatch; a centralized external-command
+boundary that eliminates shell-quoting and encoding defects by construction;
+comprehensive error handling with retry-with-backoff for transient conditions;
+and idempotent, resumable, non-destructive operation.  The Go toolchain's static
+analysis reports zero findings, the codebase is canonically formatted, and an
+automated suite of 131 tests passes -- with the highest-risk parsing logic pinned
+by fixtures carried over from the field-proven reference.  Uniquely, the binary
+is certified observationally equivalent to that reference implementation, which
+has itself been validated against real customer migrations.
+
+Within the scope stated in Section 2, this review identified no critical defects.
+
+The software is additionally subjected to ongoing field validation against real
+Zimbra environments as part of Mission Critical Email's engineering process.
+
+================================================================================
+Mission Critical Email LLC.  This document describes software that is the
+proprietary, copyrighted intellectual property of Mission Critical Email LLC.
+================================================================================
