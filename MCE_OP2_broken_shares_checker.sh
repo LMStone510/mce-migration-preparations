@@ -8,7 +8,7 @@
 #                                                                                                             #
 # Usage           : MCE_OP2_broken_shares_checker.sh [--jobs N] [--delay SEC]                                 #
 #                                                   [--timeout SEC] [--output-dir DIR] [-h]                   #
-# Last Updated    : 30 May 2026 (script version 2.1.0)                                                        #
+# Last Updated    : 15 Jun 2026 (v2.2.0 - flag orphaned/zombie mountpoints whose owner account was deleted)    #
 #                                                                                                             #
 # Why this exists :                                                                                           #
 #   Broken shares accumulate over time on any long-running Zimbra system as users are added/removed,          #
@@ -22,7 +22,9 @@
 # What it detects :                                                                                           #
 #   1. INBOUND broken shares (broken mount points).  Folders in user mailboxes that are mount points to       #
 #      shares whose source folder no longer exists or is inaccessible.  Detected via zmsoap                   #
-#      GetFolderRequest looking for the broken="1" XML attribute.                                             #
+#      GetFolderRequest looking for the broken="1" XML attribute.  v2.2.0 also     #
+#      flags "zombie" mountpoints whose OWNER ACCOUNT was deleted (its zid no       #
+#      longer resolves in LDAP) -- Zimbra often leaves broken="1" unset on these.   #
 #   2. OUTBOUND broken shares (invalid recipients).  Shares granted by users TO recipients that no longer     #
 #      exist on the system.  Detected by reading each user's zimbraSharedItem LDAP attribute and attempting   #
 #      to resolve each grantee back to a live account.                                                        #
@@ -77,7 +79,7 @@ export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 
 # Script version
-VERSION="2.1.0"
+VERSION="2.2.0"
 
 # ---------------------------------------------------------------------------
 # Defaults (overridable via CLI flags parsed in parse_args)
@@ -614,6 +616,24 @@ check_one_account_inbound() {
         done < <(echo "$folder_data" | grep 'broken="1"')
     fi
 
+    # v2.2.0: orphaned-mountpoint ("zombie") candidates.  A mountpoint whose OWNER
+    # ACCOUNT was deleted is a <link> whose owner zimbraId (zid) no longer resolves
+    # -- and Zimbra frequently does NOT set broken="1" on it, so the scan above
+    # misses it.  Emit each non-broken mountpoint <link> with its owner zid; the
+    # PARENT resolves the zid against LDAP and flags the unresolvable ones (LDAP
+    # lookups are kept out of the parallel worker).  Lookbehind on the leading
+    # space isolates the link's own id/name from rid="/zid="/oname=".
+    local link_id link_path link_name link_zid
+    while read -r line; do
+        link_zid=$(echo "$line" | grep -oP 'zid="\K[^"]+' || true)
+        [[ -z "$link_zid" ]] && continue
+        link_id=$(echo "$line"   | grep -oP '(?<= )id="\K[^"]+' || true)
+        link_path=$(echo "$line" | grep -oP 'absFolderPath="\K[^"]+' || true)
+        link_name=$(echo "$line" | grep -oP '(?<= )name="\K[^"]+' || true)
+        [[ -n "$link_id" ]] && printf 'MOUNT\t%s\t%s\t%s\t%s\t%s\n' \
+            "$user_email" "$link_id" "$link_path" "$link_name" "$link_zid"
+    done < <(echo "$folder_data" | grep '<link ' | grep -v 'broken="1"')
+
     return 0
 }
 export -f check_one_account_inbound
@@ -744,13 +764,54 @@ SCRIPT_HEADER
         total_broken=$((total_broken + 1))
     done < "$sorted_broken"
 
-    rm -f "$inbound_results" "$sorted_broken"
+    # v2.2.0: resolve orphaned-mountpoint candidates (MOUNT rows).  Dedupe by owner
+    # zid and resolve each once against LDAP; a zid that does NOT resolve means the
+    # owner account was deleted -> the mountpoint is an orphaned "zombie" the
+    # broken="1" scan cannot see.  Flag them into the same CSV + removal script.
+    local sorted_mounts orphan_total=0
+    declare -A zid_unresolved=() orphan_email_seen=()
+    sorted_mounts=$(mktemp)
+    awk -F'\t' '$1 == "MOUNT"' "$inbound_results" | sort -t$'\t' -k2,2 > "$sorted_mounts"
+    if [[ -s "$sorted_mounts" ]]; then
+        local z
+        while IFS= read -r z; do
+            [[ -z "$z" ]] && continue
+            [[ "$(resolve_grantee_id_to_email "$z")" == "UNRESOLVED" ]] && zid_unresolved["$z"]=1
+        done < <(awk -F'\t' '{print $6}' "$sorted_mounts" | sort -u)
+
+        local m_email m_id m_path m_name m_zid m_path_esc m_name_esc
+        while IFS=$'\t' read -r _ m_email m_id m_path m_name m_zid; do
+            [[ -n "${zid_unresolved[$m_zid]:-}" ]] || continue
+            m_path_esc="${m_path//\"/\"\"}"
+            m_name_esc="${m_name//\"/\"\"}"
+            printf '"%s","%s","%s","%s"\n' "$m_email" "$m_id" "$m_path_esc" "$m_name_esc" >> "$INBOUND_CSV"
+            {
+                echo ""
+                echo "# User: $m_email - Remove ORPHANED mountpoint (owner account deleted): $m_path"
+                printf 'echo "[%s] Removing orphaned mountpoint ID %s: %s"\n' \
+                    "$(printf '%q' "$m_email")" "$(printf '%q' "$m_id")" "$(printf '%q' "$m_path")"
+                printf 'zmmailbox -z -m %s df %s 2>&1 || echo "  [WARNING] Error removing folder %s"\n' \
+                    "$(printf '%q' "$m_email")" "$(printf '%q' "$m_id")" "$(printf '%q' "$m_id")"
+            } >> "$INBOUND_SCRIPT"
+            orphan_total=$((orphan_total + 1))
+            orphan_email_seen["$m_email"]=1
+        done < "$sorted_mounts"
+    fi
+    local orphan_users=${#orphan_email_seen[@]}
+
+    rm -f "$inbound_results" "$sorted_broken" "$sorted_mounts"
+
+    # Orphaned mountpoints ARE broken inbound shares -> fold into the total.
+    total_broken=$((total_broken + orphan_total))
 
     log_message INFO ""
     log_message SUCCESS "Inbound shares check finished"
     log_message INFO "  Users checked: $total_users"
     log_message INFO "  Users with broken mount points: $users_with_broken"
     log_message INFO "  Total broken mount points: $total_broken"
+    if [[ $orphan_total -gt 0 ]]; then
+        log_message WARNING "  Of those, orphaned (owner account deleted): $orphan_total across $orphan_users user(s)"
+    fi
     if [[ $timeout_count -gt 0 ]]; then
         log_message WARNING "  Timeouts (after retry): $timeout_count"
     fi
