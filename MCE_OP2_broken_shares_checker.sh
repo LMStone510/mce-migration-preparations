@@ -8,7 +8,7 @@
 #                                                                                                             #
 # Usage           : MCE_OP2_broken_shares_checker.sh [--jobs N] [--delay SEC]                                 #
 #                                                   [--timeout SEC] [--output-dir DIR] [-h]                   #
-# Last Updated    : 15 Jun 2026 (v2.2.0 - flag orphaned/zombie mountpoints whose owner account was deleted)    #
+# Last Updated    : 15 Jun 2026 (v2.2.0 - flag orphaned/zombie mountpoints whose owner account was deleted)   #
 #                                                                                                             #
 # Why this exists :                                                                                           #
 #   Broken shares accumulate over time on any long-running Zimbra system as users are added/removed,          #
@@ -22,9 +22,9 @@
 # What it detects :                                                                                           #
 #   1. INBOUND broken shares (broken mount points).  Folders in user mailboxes that are mount points to       #
 #      shares whose source folder no longer exists or is inaccessible.  Detected via zmsoap                   #
-#      GetFolderRequest looking for the broken="1" XML attribute.  v2.2.0 also     #
-#      flags "zombie" mountpoints whose OWNER ACCOUNT was deleted (its zid no       #
-#      longer resolves in LDAP) -- Zimbra often leaves broken="1" unset on these.   #
+#      GetFolderRequest looking for the broken="1" XML attribute.  v2.2.0 also                                #
+#      flags "zombie" mountpoints whose OWNER ACCOUNT was deleted (its zid no                                 #
+#      longer resolves in LDAP) -- Zimbra often leaves broken="1" unset on these.                             #
 #   2. OUTBOUND broken shares (invalid recipients).  Shares granted by users TO recipients that no longer     #
 #      exist on the system.  Detected by reading each user's zimbraSharedItem LDAP attribute and attempting   #
 #      to resolve each grantee back to a live account.                                                        #
