@@ -25,6 +25,10 @@ tells you, in order, what to run and why it matters.
 > Throughout, the binary is written as `mce-backup-restore`. Your delivered
 > build may have a different filename; substitute its path.
 
+**Also in this repository:**
+- [MCE Zimbra Migration — Information Sheet (PDF)](MCE-Zimbra-Migration-Information-Sheet.pdf) — a two-page overview of the migration offering.
+- [Static Code Review & Control-Flow Analysis](MissionCriticalEmail_Migration_Software_Code_Review.txt) — the engineering review of the migration binary (`go vet`/`gofmt` clean, full automated test suite, certified equivalent to the field-proven reference).
+
 ---
 
 ## 1. The migration in one picture
