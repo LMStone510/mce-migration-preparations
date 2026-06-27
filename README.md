@@ -104,6 +104,12 @@ security team — sign off with confidence.
 - All account-level Zimbra Access Control Entries (ACEs)
 - All Sieve scripts (filters)
 - `zimbraId`
+- **Two-factor authentication (2FA)** — each user's TOTP shared secret, backup
+  (scratch) codes, app-specific passwords, and enabled state, carried over verbatim
+  so users keep their existing authenticator with **no re-enrollment**. Trusted-device
+  tokens are not carried (users simply re-trust their devices). On a FOSS destination,
+  install a 2FA add-on (e.g. [maldua](https://github.com/maldua-suite/zimbra-maldua-2fa))
+  to manage and enforce these settings.
 
 **User mailbox content**
 
@@ -126,9 +132,10 @@ security team — sign off with confidence.
 - **Mail blobs travel via IMAPSYNC, not the provisioning path** — that is the
   architecture, not a gap (Section 8 explains why this is an advantage)
 - GALsync accounts
-- MFA/two-factor, ActiveSync/mobile, S/MIME, ZCO/EWS, and NE Backup settings are
-  skipped automatically on a Network Edition → FOSS migration (they have no FOSS
-  equivalent and would otherwise fail account creation)
+- ActiveSync/mobile, S/MIME, ZCO/EWS, and NE Backup settings are skipped
+  automatically on a Network Edition → FOSS migration (they have no native FOSS
+  equivalent and would otherwise fail account creation). *(Two-factor authentication
+  is the exception — it **is** migrated; see "What migrates" above.)*
 - Custom `localconfig` values, MTA settings, SSL certificates, branding/theming,
   and external auth integrations (Okta/JumpCloud/AD) — these belong to the
   destination's own build
