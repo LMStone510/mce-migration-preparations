@@ -13,6 +13,7 @@ below).  You may use, copy, modify, and redistribute them under those terms:
 
     MCE_OP1_imap_preflight.sh
     MCE_OP2_broken_shares_checker.sh
+    MCE_OP3_mailbox_license_count.sh
 
 (Each script also carries the MIT License in its own header.)
 

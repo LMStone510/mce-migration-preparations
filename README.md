@@ -2,13 +2,13 @@
   Copyright (c) 2026 Mission Critical Email LLC.  All rights reserved.
   This document is proprietary.  It may NOT be copied, modified, redistributed,
   or republished, in whole or in part, without the prior written permission of
-  Mission Critical Email LLC.  See LICENSE.  (The operator scripts OP1/OP2 in
+  Mission Critical Email LLC.  See LICENSE.  (The operator scripts OP1/OP2/OP3 in
   this repository are separately MIT-licensed; this notice does not apply to them.)
 -->
 
 # Mission Critical Email — Zimbra Migration: Operator Guide
 
-This repository holds the two **preparation scripts** you run on your source
+This repository holds the **preparation scripts** you run on your source
 Zimbra server before a migration, plus the operator guide for the **Mission
 Critical Email migration binary** that performs the backup and restore.
 
@@ -168,8 +168,9 @@ source and destination systems.
   reachable on the **source** (export, during backup) and the **destination**
   (import, during restore). Give the binary the proxy host at the prompt, or via
   `ZIMBRA_PROXY_HOST`.
-- **The OP1/OP2 scripts** (this repo): need `bash`, `ldapsearch`, `zmprov`,
-  `zmmailbox`, `zmsoap`. `GNU parallel` is optional (OP2 falls back to sequential).
+- **The OP1/OP2/OP3 scripts** (this repo): all need `bash` and `zmprov`; OP1/OP2
+  additionally need `ldapsearch`, `zmmailbox`, `zmsoap`. `GNU parallel` is optional
+  (OP2 falls back to sequential). OP3 needs only `zmprov`.
 - **The IMAPSYNC host:** any box that can reach both servers' IMAP ports and has
   `imapsync` installed. `tmux` is recommended but optional.
 - **Data transfer:** the `zimbra` user has no password and its SSH keys must not
@@ -180,9 +181,12 @@ source and destination systems.
 
 ## 4. Preparation scripts (run on the SOURCE, before any backup)
 
-Both are **read-only** by themselves — they only ever generate a file you review
-and apply yourself. The migration binary will prompt you to confirm both have been run,
-and you should not answer "yes" until they have.
+All three are **read-only** by themselves: OP1 and OP2 only ever generate a file
+you review and apply yourself, and OP3 only reports a count — none of them change
+your system on their own. The migration binary will prompt you to confirm the two
+fix scripts (OP1/OP2) have been run, and you should not answer "yes" until they have.
+OP3 (mailbox license count) is independent — run it whenever you need to size a
+license, including before you buy.
 
 ### 4.1 `MCE_OP2_broken_shares_checker.sh` — clean up broken shares first
 
@@ -226,6 +230,27 @@ zmprov -f /tmp/MCE_OP1_imap_preflight_<timestamp>.zmp
 > created when a user shares a folder to an outside address. Those should **not**
 > have IMAP enabled, so the script reports them as excluded rather than flagging
 > them.
+
+### 4.3 `MCE_OP3_mailbox_license_count.sh` — count the mailboxes to license
+
+Unlike OP1/OP2, this script applies nothing — it just **reports how many mailboxes
+a migration will license**, reproducing the migration binary's own account
+enumeration exactly: `zmprov -l gaa`, minus Zimbra **system accounts**
+(galsync/ham./spam./virus-quarantine), minus **external virtual accounts**
+(`zimbraIsExternalVirtualAccount=TRUE`). The survivors are the licensable count.
+Run it on the source to size your license with certainty — no guesswork, no
+over- or under-buying.
+
+```bash
+bash MCE_OP3_mailbox_license_count.sh --output-dir /tmp
+```
+
+It prints a full breakdown (total → system excluded → external excluded →
+licensable) and writes a report plus the licensable account list for your records.
+LDAP-only and fast — needs only `zmprov`, no per-mailbox probing. The count is
+**deployment-wide** (LDAP is global, so any one mailstore sees the whole system):
+license that number to migrate the entire deployment, or license a subset if you
+are migrating only some accounts.
 
 ---
 
@@ -404,8 +429,11 @@ phase at the wrong time can lose data.
 ## 9. Licensing & support
 
 The migration binary is licensed per customer by Mission Critical Email and is
-bound to your server identity; the OP1/OP2 scripts in this repository are MIT
-(see `LICENSE`). For a license, a build, or migration help:
+bound to your server identity; the OP1/OP2/OP3 scripts in this repository are MIT
+(see `LICENSE`). To size your license before you buy, run
+`MCE_OP3_mailbox_license_count.sh` on your source (Section 4.3) — it reports the
+exact mailbox count the migration will license. For a license, a build, or
+migration help:
 
 **Mission Critical Email LLC** — sales@missioncriticalemail.com
 
