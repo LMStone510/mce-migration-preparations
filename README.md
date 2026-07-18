@@ -27,6 +27,7 @@ tells you, in order, what to run and why it matters.
 
 **Also in this repository:**
 - [MCE Zimbra Migration — Information Sheet (PDF)](MCE-Zimbra-Migration-Information-Sheet.pdf) — a two-page overview of the migration offering.
+- [IMAPSYNC Server Preparation](MCE-IMAPSYNC-Server-Preparation.md) — provisioning the IMAPSYNC host's persistent UID cache (binary v15.4.0+): dedicated XFS volume, inode sizing, validation. Large migrations should read this **before** the first bulk mail pass.
 - [Static Code Review & Control-Flow Analysis](MissionCriticalEmail_Migration_Software_Code_Review.txt) — the engineering review of the migration binary (`go vet`/`gofmt` clean, full automated test suite, certified equivalent to the field-proven reference).
 
 ---
@@ -172,7 +173,9 @@ source and destination systems.
   additionally need `ldapsearch`, `zmmailbox`, `zmsoap`. `GNU parallel` is optional
   (OP2 falls back to sequential). OP3 needs only `zmprov`.
 - **The IMAPSYNC host:** any box that can reach both servers' IMAP ports and has
-  `imapsync` installed. `tmux` is recommended but optional.
+  `imapsync` installed. `tmux` is recommended but optional. With binary v15.4.0+,
+  provision the persistent UID cache volume **before** the first bulk pass — see
+  [IMAPSYNC Server Preparation](MCE-IMAPSYNC-Server-Preparation.md).
 - **Data transfer:** the `zimbra` user has no password and its SSH keys must not
   be touched, so move the export with an unprivileged admin account that has an
   SSH key pair on both hosts and is a member of the `zimbra` group on the source.
@@ -420,6 +423,13 @@ phase at the wrong time can lose data.
 - **Site-specific imapsync flags** (e.g. `APPEND`-failed errors on Microsoft/Apple
   IMAP flags): add them to the `EXTRA_OPTS` array at the top of each per-group
   runner.
+- **Repeated bulk passes are cheap (v15.4.0+):** the `premigration` and
+  `postmigration` phases keep a persistent UID cache on the IMAPSYNC host, so
+  reruns skip already-transferred messages without re-fetching headers. The
+  cache needs a properly provisioned directory (inodes, not gigabytes) — set it
+  up once per [IMAPSYNC Server Preparation](MCE-IMAPSYNC-Server-Preparation.md).
+  On a rerun, each account's summary should show nearly everything as
+  *skipped*; a near-zero skipped count means the cache isn't being found.
 - **No tmux?** Run each group directly in its own terminal:
   `bash imapsync-group1.sh justfolders` (repeat per group, then move to the next
   phase). The launcher is only a convenience.
