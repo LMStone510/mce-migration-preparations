@@ -5,10 +5,10 @@
 Software reviewed : Mission Critical Email Backup-Restore -- the migration
                     binary (Go, release line 15.x).  A single statically-linked
                     executable; no runtime dependencies, no bundled libraries.
-Size              : ~6,300 lines of Go (product code) + ~4,000 lines of
+Size              : ~8,700 lines of Go (product code) + ~5,900 lines of
                     automated tests, across 10 internal packages.
 Prepared by       : Mission Critical Email LLC -- Engineering
-Date              : 16 June 2026
+Date              : 24 July 2026 (supersedes the 16 June 2026 edition)
 Classification    : May be shared with prospective and active customers.
 
 This report summarizes a structured review of the migration software's
@@ -19,10 +19,13 @@ review appropriate to production-grade migration tooling.
 
 Lineage note: the software was originally delivered as a field-proven bash
 orchestration script.  It has since been re-implemented as a compiled Go binary,
-which is now the production line.  The Go binary is CERTIFIED OBSERVATIONALLY
-EQUIVALENT to the frozen bash reference (Section 7.2) -- the disciplined behavior
-documented in earlier reviews is preserved, now with the additional safety of a
-type-checked, compiled implementation and an automated test suite.
+which is now the production line.  The Go binary was first CERTIFIED
+OBSERVATIONALLY EQUIVALENT to the frozen bash reference (Section 7.2); since
+that certification, the Go line has moved deliberately BEYOND the reference --
+both with new capabilities and by finding and fixing latent defects the
+reference itself carried for years (Section 7.4).  Every divergence from the
+reference is individually documented, rationalized, and pinned by regression
+tests in the engineering record.
 
 
 RESULTS AT A GLANCE
@@ -34,8 +37,10 @@ RESULTS AT A GLANCE
   | Error handling & recovery           | Pass                       |
   | Static analysis (go vet)            | Pass (0 findings)          |
   | Formatting conformance (gofmt)      | Pass (clean)               |
-  | Automated test suite                | Pass (131 tests)           |
-  | Equivalence to field-proven oracle  | Pass (certified)           |
+  | Automated test suite                | Pass (187 tests)           |
+  | Equivalence to field-proven oracle  | Pass (certified at parity) |
+  | Boundary-assumptions audit          | Complete (Section 3, h)    |
+  | Independent multi-agent review      | Pass (2 findings; fixed)   |
   | Data-safety properties              | Pass                       |
   | Security posture (code-level)       | No findings                |
   | Critical defects                    | 0                          |
@@ -50,8 +55,13 @@ RESULTS AT A GLANCE
 The migration software performs disaster-recovery-style backup and restore of a
 Zimbra environment -- Classes of Service, domains, accounts, aliases,
 signatures, distribution lists, per-folder data (calendars, contacts, tasks,
-briefcase), share grants and mountpoints, DKIM keys, and (via IMAPSYNC) mailbox
-message content.  See the README for more details.
+briefcase), share grants and mountpoints, DKIM keys, per-user two-factor
+authentication state, out-of-office auto-reply settings, RSS/ICS folder
+subscriptions, and (via IMAPSYNC) mailbox message content.  A license may scope
+a binary to an exact set of mail domains for staged, multi-wave migrations of
+multi-tenant systems; a scoped binary exports and restores ONLY those domains
+and refuses out-of-scope work on both the backup and restore sides.  See the
+README for more details.
 
 This review covers the backup/restore migration binary.  Its goals:
 
@@ -64,8 +74,8 @@ This review covers the backup/restore migration binary.  Its goals:
 
 2.  SCOPE & LIMITATIONS
 --------------------------------------------------------------------------------
-This review evaluated the migration binary's Go source (~6,300 lines of product
-code across 10 internal packages, plus ~4,000 lines of automated tests).  It
+This review evaluated the migration binary's Go source (~8,700 lines of product
+code across 10 internal packages, plus ~5,900 lines of automated tests).  It
 comprised static analysis, control-flow analysis, error-path analysis, automated
 testing, equivalence verification against the field-proven reference, and
 engineering best-practice assessment of that source.
@@ -99,7 +109,7 @@ The review applied the techniques standard to evaluating production Go software:
   (b) Formatting conformance with `gofmt` -- the canonical Go formatter -- so the
       entire codebase is mechanically consistent and diff-clean.
 
-  (c) Automated test suite -- 131 test functions across all 10 internal packages,
+  (c) Automated test suite -- 187 test functions across all 10 internal packages,
       including table-driven tests carried over verbatim from the reference
       implementation's unit-test fixtures (the parser and inversion logic most
       prone to subtle bugs), run with the race-free standard `go test`.
@@ -118,6 +128,23 @@ The review applied the techniques standard to evaluating production Go software:
 
   (g) Best-practice conformance -- defensive coding, fail-fast pre-flight
       validation, idempotency, least privilege, and auditability.
+
+  (h) Boundary-assumptions audit -- three independent structured surveys of
+      every external interface: each command the binary invokes, each parser of
+      external output, each constructed payload, and the provenance of every
+      test fixture.  Every wire-format assumption was cataloged in a register
+      and classified (pinned to a real capture / synthetic fixture /
+      unverified); each finding was fixed or explicitly documented as an
+      accepted, bounded risk.  The register ships with the source as a living
+      engineering document.
+
+  (i) Independent multi-agent adversarial review -- the full change set was
+      additionally submitted to an independent, automated multi-agent code
+      review (multiple analysis agents with no access to the authors' context
+      or assumptions).  It produced two verified findings; both were accepted,
+      fixed, and pinned with regression tests.  Notably, it re-flagged none of
+      the documented accepted risks and contradicted none of the register's
+      "verified safe" determinations.
 
 
 4.  ARCHITECTURE OVERVIEW
@@ -259,13 +286,19 @@ The software treats failure handling as a first-class design concern.
    Compilation                   : builds clean as a single statically-linked
                                    binary (CGO disabled); one binary serves both
                                    Debian/Ubuntu and RHEL/Rocky targets.
-   Automated tests (go test)     : 131 test functions across all 10 internal
+   Automated tests (go test)     : 187 test functions across all 10 internal
                                    packages PASS.  Coverage emphasizes the
                                    highest-risk logic -- the Zimbra-output parsers
                                    and the share-inversion logic -- via table-
-                                   driven tests carried over verbatim from the
-                                   reference implementation's unit-test fixtures.
-   Test-to-code ratio            : ~4,000 lines of tests to ~6,300 lines of
+                                   driven tests carried over from the reference
+                                   implementation's unit-test fixtures, and
+                                   extended with fixtures drawn from REAL
+                                   protocol captures taken during production
+                                   migrations (a policy adopted after the
+                                   boundary audit: parsers of external formats
+                                   are pinned to actual wire data, not merely
+                                   plausible synthetic data).
+   Test-to-code ratio            : ~5,900 lines of tests to ~8,700 lines of
                                    product code.
 
    Software composition / dependencies: the binary is built from the Go standard
@@ -285,21 +318,47 @@ The software treats failure handling as a first-class design concern.
    same ordered set of external commands and produces the same generated files as
    the frozen bash reference.  Result: an identical command sequence and byte-
    identical generated output, apart from a small, DOCUMENTED set of deliberate
-   improvements (e.g. suppressing redundant, non-actionable log noise) and one
-   regression fix -- each recorded, rationalized, and test-pinned in the
-   engineering record.  This gives the Go binary an unusual assurance basis: it is
-   measured against an implementation already proven against real customer data.
+   improvements -- each recorded, rationalized, and test-pinned in the
+   engineering record.  This gave the Go binary an unusual assurance basis at
+   its baseline: it was measured against an implementation already proven
+   against real customer data.  Since certification, the line has deliberately
+   diverged from the reference where the reference was found to be WRONG
+   (Section 7.4); equivalence remains the documented baseline, not a ceiling.
 
 7.3  Field validation
    Beyond automated testing, the binary is exercised end to end against real
-   Zimbra environments: a full provisioning-and-data restore, and a full
-   production backup of a multi-hundred-account Network Edition source, both
-   completed clean.  Field validation is an ongoing part of Mission Critical
-   Email's engineering process.
+   Zimbra environments.  As of this edition that includes: multiple live customer
+   production cutovers completed on this line; repeated clean-slate migration
+   cycles of a multi-hundred-account production Network Edition system to a
+   FOSS destination, with source/destination trees compared folder by folder
+   and attribute by attribute; and a staged-wave cycle using a domain-scoped
+   binary, verifying both the scoped export (only licensed domains and their
+   data travel -- including that other tenants' DKIM signing keys do NOT) and
+   the restore-side refusal of out-of-scope backups.  Validation fixtures
+   deliberately include an 18-year-old power-user dataset (non-ASCII folder
+   names, alias-identity shares, legacy folder metadata, feed subscriptions)
+   chosen precisely because it surfaces edge cases that clean test data cannot.
+   Field validation is an ongoing part of Mission Critical Email's engineering
+   process, and its results are recorded per release in the engineering record.
 
    Locale and character-set handling is explicit throughout: the binary asserts a
    UTF-8 locale at startup and enforces it at the single external-command
-   boundary, protecting against multi-byte data corruption end to end.
+   boundary, protecting against multi-byte data corruption end to end.  This
+   extends to protocol-level encodings: IMAP wire folder names (RFC 3501
+   modified UTF-7) and LDAP base64-encoded values are handled explicitly, with
+   the encoders/decoders pinned to real captured protocol data.
+
+7.4  Defects inherited from the reference: found and fixed
+   A distinctive property of this line's engineering record: the audit and
+   field-validation program identified a number of LATENT defects that the
+   field-proven bash reference itself had carried silently for years --
+   including several silent-data-omission paths (data classes that never
+   migrated, with no error reported).  Each was fixed in the Go line, recorded
+   as a documented divergence from the reference, and pinned with a regression
+   test built from the real-world data that exposed it.  The engineering
+   posture is explicit: fidelity to the reference was a porting instrument, not
+   a goal -- once parity was certified, inherited defects are fixed as a matter
+   of course and the divergence ledger is the record of proof.
 
 
 8.  SAFETY & DATA-PROTECTION PROPERTIES
@@ -315,15 +374,33 @@ The software treats failure handling as a first-class design concern.
      WITHOUT moving mailbox content, so a customer can validate the outcome
      before committing to a cutover.
    - Least privilege: runs as the unprivileged Zimbra service user, needs no
-     root, installs nothing into Zimbra, uses a dedicated migration administrator
-     account, and is license-gated to authorized hosts.  Its only network egress
-     is to the Zimbra reverse proxy of the systems being migrated -- no telemetry,
-     no external calls.
+     root, installs nothing into Zimbra, and is license-gated to authorized
+     hosts.  It uses dedicated migration administrator credentials -- a backup
+     collects two sets, one for the IMAPSYNC mail transfer and one for the
+     proxy data path.  These may be the same account only if that account has
+     two-factor authentication disabled (the proxy data path cannot
+     authenticate a 2FA-enabled account; a SEPARATE IMAPSYNC account may keep
+     2FA by using an app-specific password).  The binary's only network egress
+     is to the Zimbra reverse proxy of the systems being migrated -- no
+     telemetry, no external calls.
    - Fully auditable: comprehensive, timestamped, serialized logging with a
      separate error log; every created and skipped item is recorded.  In
      addition, the binary can emit a complete machine-readable transcript of
-     EVERY external command it executes, so a reviewer can confirm exactly what
-     the binary does on their systems.
+     EVERY external command it executes (enabled with the --record flag).  The
+     mechanism is structural: every external command the binary runs already
+     flows through its single command choke point, and with recording enabled
+     that choke point appends one JSON line -- the program, its full argument
+     list, and any data fed on standard input -- to the transcript file before
+     executing the command.  Completeness is therefore by construction: there
+     is no second code path by which a command could run unrecorded.  A
+     reviewer can thus confirm exactly what the binary does on their systems.
+     (Such transcripts capture command arguments verbatim, including
+     credentials, and are documented to be handled as secrets.)
+   - Self-identifying: every delivered binary prints its own embedded,
+     signature-verified license -- domain scope, authorized hosts, seat cap,
+     validity window -- on request, on any machine.  Delivery integrity is
+     verified by a SHA-256 checksum command generated at build time for the
+     operator to run verbatim.
 
 
 9.  SUMMARY & CONCLUSION
@@ -335,15 +412,19 @@ boundary that eliminates shell-quoting and encoding defects by construction;
 comprehensive error handling with retry-with-backoff for transient conditions;
 and idempotent, resumable, non-destructive operation.  The Go toolchain's static
 analysis reports zero findings, the codebase is canonically formatted, and an
-automated suite of 131 tests passes -- with the highest-risk parsing logic pinned
-by fixtures carried over from the field-proven reference.  Uniquely, the binary
-is certified observationally equivalent to that reference implementation, which
-has itself been validated against real customer migrations.
+automated suite of 187 tests passes -- with the highest-risk parsing logic pinned
+by fixtures drawn from real protocol captures.  The binary was certified
+observationally equivalent to the field-proven reference implementation at its
+baseline, has since been hardened by a structured boundary-assumptions audit
+and an independent multi-agent adversarial review (two findings, both fixed),
+and has repaired latent defects the reference itself carried -- each divergence
+documented and regression-pinned.
 
 Within the scope stated in Section 2, this review identified no critical defects.
 
 The software is additionally subjected to ongoing field validation against real
-Zimbra environments as part of Mission Critical Email's engineering process.
+Zimbra environments as part of Mission Critical Email's engineering process and
+actual, ongoing customer migrations.
 
 ================================================================================
 Mission Critical Email LLC.  This document describes software that is the
