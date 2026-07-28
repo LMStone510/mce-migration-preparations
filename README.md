@@ -22,6 +22,7 @@ The migration binary is a separately licensed product. It is **not** in this rep
 - [MCE Zimbra Migration — Information Sheet (PDF)](MCE-Zimbra-Migration-Information-Sheet.pdf) — a two-page overview of the migration offering.
 - [IMAPSYNC Server Preparation](MCE-IMAPSYNC-Server-Preparation.md) — how to avoid failed imapsyncs due to running out of inodes.
 - [MCE License Count script](MCE_OP3_mailbox_license_count.sh) — run on the source server to determine how many seats to license.
+- [MCE CoS Override Report](MCE_OP4_cos_override_report.sh) — run on the source server to list every account-level override of a CoS-managed policy attribute (see "What does not migrate").
 - [Static Code Review & Control-Flow Analysis](MissionCriticalEmail_Migration_Software_Code_Review.txt) — the engineering review of the migration binary.
 
 ---
@@ -108,6 +109,7 @@ The binary migrates your Zimbra **provisioning and mailbox data**; the IMAPSYNC 
 - Custom `localconfig` values, MTA settings, SSL certificates, branding/theming, and external auth integrations (Okta/JumpCloud/AD) — these belong to the destination's own build.
 - Domain-level ACEs (account-level ACEs *do* migrate); and the admin-role flags themselves (`zimbraIsAdminAccount` / `zimbraIsDelegatedAdminAccount`) are intentionally not set on the destination — admins are exported for reference and reconstructed deliberately.
 - Per-domain public-service hostname/port/protocol (you set those on the destination, since they often change as a result of the migration).
+- **Account-level overrides of CoS-managed policy attributes that *loosen* policy, plus override cruft.** Those attributes belong at the Class of Service level, and account-level values are often forgotten one-off workarounds that silently exempt an account from its COS forever. The migration handles the class in tiers: overrides that **tighten security or encode operational policy** (password locks, forwarding-permission policy, per-seat feature grants like EWS and S/MIME, quotas, session lifetimes, 2FA-required/available = TRUE) **do migrate** — dropping those would silently weaken the destination — and every one applied is recorded by the restore in `applied_policy_overrides.txt`, with per-account **quota** overrides called out separately (they interact with COS-keyed billing plans). Overrides that **loosen** policy (e.g. a 2FA exemption on an application account) and provisioning leftovers are deliberately **not** migrated: they surface during your dry-run testing, where they can be fixed properly (that application account belongs on an **app-specific password**, which the migration *does* carry — not on a 2FA exemption). Run [MCE_OP4_cos_override_report.sh](MCE_OP4_cos_override_report.sh) on your source **before** the dry run: it lists exactly what will not migrate and generates an optional reapply batch for anything you conclude is load-bearing. *(User preferences — `zimbraPref*` — are not policy and migrate normally, as do account status and mail forwarding.)*
 
 ---
 
@@ -168,6 +170,16 @@ bash MCE_OP3_mailbox_license_count.sh --output-dir /tmp
 ```
 
 It prints a full breakdown (total → system excluded → external excluded → licensable) and writes a report plus the licensable account list for your records. LDAP-only and fast — needs only `zmprov`, no per-mailbox probing. The count is **deployment-wide** (LDAP is global, so any one mailstore sees the whole system): license that number to migrate the entire deployment, or license a subset if you are migrating only selected domains. Maybe license a few extra seats if you expect to add mailboxes right before the migration; **note that the binary will not run if there are more mailboxes present than were licensed!**
+
+### 4.4 `MCE_OP4_cos_override_report.sh` — see which accounts break CoS inheritance
+
+Read-only, like its siblings. It lists every account-level override of a CoS-managed policy attribute that the migration will deliberately **not** carry — the loosening exemptions and provisioning leftovers (Section 2, "What does not migrate"). Security-tightening and operational-policy overrides migrate automatically and are excluded here, as is `zimbraImapEnabled` (OP1's job) — so this report is exactly your review list, nothing more. Run it before your dry run so nothing surfaces as a surprise:
+
+```bash
+bash MCE_OP4_cos_override_report.sh --output-dir /var/tmp
+```
+
+It writes a CSV report (account, attribute, value) and a `zmprov -f` reapply batch. Review the CSV: most of what remains is redundant or forgotten; anything genuinely load-bearing is usually better fixed properly (dedicated COS, app-specific password) than re-applied — but the batch re-creates it on the destination after migration if you decide that is the right call.
 
 ---
 
