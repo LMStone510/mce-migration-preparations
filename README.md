@@ -119,6 +119,14 @@ The binary migrates your Zimbra **provisioning and mailbox data**; the IMAPSYNC 
 Run everything as the **`zimbra`** user, on a single Zimbra **mailbox** server, inside a `screen` or `tmux` session (these runs are long); one mailbox server on each of the source and destination systems.
 
 - **Source & destination:** a working Zimbra mailstore on each end. Do **not** pre-create Classes of Service on the destination — the binary migrates them (pre-creating them causes `_restored` duplicates). Configure the destination's MTA, anti-spam/AV, and server-wide `zimbraPublicServiceHostname/Port/Protocol` to the destination's own environment before restoring.
+- **Maximum message sizes — destination must accept what the source holds.** Check that `zimbraMtaMaxMessageSize` and `zimbraFileUploadMaxSize` on the destination are **no smaller than on the source** — otherwise the `premigration` IMAPSYNC pass will likely fail to transfer the larger message blobs (and large attachment uploads can fail too). Compare with one command on each system, and raise the destination to at least the source's values:
+
+  ```bash
+  zmprov gacf zimbraFileUploadMaxSize zimbraMtaMaxMessageSize      # run on BOTH systems and compare
+  zmprov mcf zimbraMtaMaxMessageSize <bytes>       # on the destination, if smaller than the source
+  zmprov mcf zimbraFileUploadMaxSize <bytes>       # on the destination, if smaller than the source
+  ```
+
 - **Network Edition destinations on Zimbra 10.1+ (V3 licensing):** The licensing engine in Zimbra 10.1 takes a very strict approach to licensed features entitlements, and will block any accounts from being migrated if Classes of Service are configured such that one or more entitlements could possibly be exceeded. In practice, this happens only when the V3 license on the destination system contains Network Edition Standard seats, either exclusively or in combination with Network Edition Professional seats. Before launching the first dry-run migration, make sure that the new "default" Class of Service on the destination system as well as all of the Classes of Service on the source system, are configured to prevent you from even accidentally exceeding your entitlements for Mobile, Archiving, S/MIME, ZCO, EWS and EAS. See <https://www.missioncriticalemail.com/2025/06/09/zimbra-10-1-licensing-server-lds-best-practices/> for more detail.
 - **Admin console reverse proxy (TCP 9071) — on both source and destination:** the binary runs on a single mailbox server but needs to reach all accounts in a multi-server environment, so we route this traffic through the proxy service (even on a single server). To proxy the Admin Console, run on every proxy server:
 
