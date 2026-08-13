@@ -6,8 +6,8 @@
 #                   mailboxes that the Mission Critical Email migration Software counts against a license,    #
 #                   so a prospective customer can license precisely the right quantity -- no guesswork.       #
 #                   Read-only: it inspects the source system and changes nothing.                             #
-# Usage           : MCE_OP3_mailbox_license_count.sh [--output-dir DIR] [-o FILE] [-h]                        #
-# Last Updated    : 01 Jul 2026 (v1.0.0 - initial release)                                                    #
+# Usage           : MCE_OP3_mailbox_license_count.sh [--domains LIST] [--output-dir DIR] [-o FILE] [-h]       #
+# Last Updated    : 12 Aug 2026 (v1.1.0 - --domains scope filter for per-wave / domain-scoped licensing)      #
 # Copyright 2026  : Mission Critical Email LLC. All rights reserved.                                          #
 #                                                                                                             #
 # What it does    :                                                                                           #
@@ -24,8 +24,11 @@
 #                                                                                                             #
 # Scope note:                                                                                                 #
 #   zmprov -l gaa is deployment-wide (LDAP is global), so running this on ANY one mailstore counts the        #
-#   WHOLE deployment.  The number reported is for migrating the ENTIRE system; if you plan to migrate only    #
-#   a subset of accounts, license that subset.                                                                #
+#   WHOLE deployment.  The number reported is for migrating the ENTIRE system.  For a DOMAIN-SCOPED           #
+#   (per-wave) license, pass the wave's domains via --domains: only accounts whose primary address is in      #
+#   one of those domains are counted -- the same scoping the migration Software's domain-scoped binaries      #
+#   enforce.  List the PRIMARY (local) domains; alias domains ride along in the Software automatically and    #
+#   never change the count (accounts are counted once, by primary address).                                   #
 #                                                                                                             #
 # Run as          : the 'zimbra' user, on a Zimbra mailstore in the SOURCE deployment.                        #
 #                                                                                                             #
@@ -57,12 +60,13 @@
 
 set -u
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # ---------- defaults ----------
 
 OUTPUT_FILE=""
 OUTPUT_DIR=""
+DOMAINS=""            # comma/space-separated primary domains; empty = whole deployment
 
 # System-account exclusion pattern.  This MUST stay identical to the migration
 # Software's enumeration (Go internal/backup/accounts.go, mirroring bash
@@ -86,17 +90,30 @@ while [[ $# -gt 0 ]]; do
       OUTPUT_DIR="${1:-}"
       shift
       ;;
+    --domains)
+      shift
+      DOMAINS="${DOMAINS:+$DOMAINS,}${1:-}"
+      shift
+      ;;
     -h|--help)
       cat <<EOF
-Usage: $(basename "$0") [--output-dir DIR] [-o FILE]
+Usage: $(basename "$0") [--domains LIST] [--output-dir DIR] [-o FILE]
 
 Reports the number of mailboxes a Zimbra source will count against a migration
 license, reproducing the migration Software's own enumeration (LDAP-only, fast):
 
-  zmprov -l gaa  ->  drop system accounts  ->  subtract external-virtual
+  zmprov -l gaa  ->  [domain scope]  ->  drop system accounts
+                 ->  subtract external-virtual
                  ->  LICENSABLE count = surviving accounts
 
 Options:
+  --domains LIST     Count ONLY accounts whose primary address is in one of
+                     these domains (comma- or space-separated; repeatable).
+                     Use this to size a DOMAIN-SCOPED (per-wave) license --
+                     it applies the same scoping the migration Software's
+                     domain-scoped binaries enforce.  List the PRIMARY (local)
+                     domains; alias domains ride along in the Software and
+                     never change the count.
   --output-dir DIR   Directory for the auto-named report file.  Default: /tmp
                      Ignored if -o is also given.
   -o FILE            Full path for the report file.
@@ -167,11 +184,46 @@ if [[ "$TOTAL" -eq 0 ]]; then
   exit 3
 fi
 
+# ---------- step 1.5: domain scope (optional, mirrors the Software's F3 domain-scoped licensing) ----------
+
+SCOPE_EXCLUDED=0
+SCOPE_LIST=""
+SCOPE_CSV=""
+if [[ -n "$DOMAINS" ]]; then
+  # Normalize the operator's list: commas/spaces -> newlines, lowercase, dedupe.
+  SCOPE_LIST=$(printf '%s' "$DOMAINS" | tr ', ' '\n\n' | tr '[:upper:]' '[:lower:]' | grep -v '^[[:space:]]*$' | sort -u)
+  if [[ -z "$SCOPE_LIST" ]]; then
+    echo "ERROR: --domains was given but no domain names could be parsed from it." >&2
+    exit 2
+  fi
+  # Comma-joined copy for awk -v (BSD awk rejects embedded newlines there).
+  SCOPE_CSV=$(printf '%s' "$SCOPE_LIST" | tr '\n' ',')
+  echo "Applying domain scope..." >&2
+  # Keep only accounts whose primary address is in a scoped domain (match on
+  # the part after the last '@', case-insensitive -- same rule the Software's
+  # domain-scoped enumeration applies).
+  awk -v doms="$SCOPE_CSV" '
+    BEGIN { n = split(doms, a, ","); for (i = 1; i <= n; i++) if (a[i] != "") want[a[i]] = 1 }
+    { d = tolower($0); sub(/^.*@/, "", d); if (d in want) print }
+  ' "$TMP_GAA" > "${TMP_GAA}.s" || true
+  mv "${TMP_GAA}.s" "$TMP_GAA"
+  IN_SCOPE=$(grep -c . "$TMP_GAA" || true)
+  SCOPE_EXCLUDED=$(( TOTAL - IN_SCOPE ))
+  if [[ "$IN_SCOPE" -eq 0 ]]; then
+    echo "ERROR: No accounts have a primary address in the scoped domain(s)." >&2
+    echo "       List PRIMARY (local) domains -- alias domains hold no primary addresses." >&2
+    exit 3
+  fi
+  BASE=$IN_SCOPE
+else
+  BASE=$TOTAL
+fi
+
 # ---------- step 2: drop system accounts ----------
 
 grep -vE "$SYSTEM_ACCOUNT_RE" "$TMP_GAA" > "$TMP_CAND" || true
 AFTER_SYSTEM=$(grep -c . "$TMP_CAND" || true)
-SYSTEM_EXCLUDED=$(( TOTAL - AFTER_SYSTEM ))
+SYSTEM_EXCLUDED=$(( BASE - AFTER_SYSTEM ))
 
 # ---------- step 3: subtract external-virtual accounts ----------
 
@@ -203,13 +255,34 @@ write_report() {
   echo "Mailstore    : $HOST"
   echo ""
   printf '  %-42s %8d\n' "Total accounts (zmprov -l gaa):" "$TOTAL"
+  if [[ -n "$SCOPE_LIST" ]]; then
+    printf '  %-42s %8d   %s\n' "  - Out-of-scope accounts excluded:" "$SCOPE_EXCLUDED" "(--domains scope)"
+  fi
   printf '  %-42s %8d   %s\n' "  - System accounts excluded:" "$SYSTEM_EXCLUDED" "(galsync / ham. / spam. / virus-quarantine)"
   printf '  %-42s %8d   %s\n' "  - External virtual accounts excluded:" "$EXTERNAL_EXCLUDED" "(zimbraIsExternalVirtualAccount=TRUE)"
   echo "  ============================================================"
   printf '  %-42s %8d\n' "  LICENSABLE MAILBOXES:" "$LICENSABLE"
   echo ""
-  echo "  This is the count to license for migrating the ENTIRE deployment."
-  echo "  To migrate only a subset of accounts, license that subset instead."
+  if [[ -n "$SCOPE_LIST" ]]; then
+    echo "  Domain scope (licensable mailboxes per domain):"
+    awk -v doms="$SCOPE_CSV" '
+      BEGIN { n = split(doms, a, ",") }
+      { d = tolower($0); sub(/^.*@/, "", d); cnt[d]++ }
+      END {
+        for (i = 1; i <= n; i++) {
+          if (a[i] == "") continue
+          note = (cnt[a[i]] + 0 == 0) ? "   <- zero; alias domain or typo?" : ""
+          printf "    %-40s %8d%s\n", a[i] ":", cnt[a[i]] + 0, note
+        }
+      }
+    ' "$ACCOUNTS_FILE"
+    echo ""
+    echo "  This is the count to license for a DOMAIN-SCOPED (wave) binary covering"
+    echo "  the domain(s) above."
+  else
+    echo "  This is the count to license for migrating the ENTIRE deployment."
+    echo "  To migrate only a subset of domains, re-run with --domains."
+  fi
 }
 
 {
