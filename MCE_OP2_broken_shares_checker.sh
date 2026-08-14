@@ -2,13 +2,13 @@
 
 ###############################################################################################################
 #                                                                                                             #
-# Description     : Operator preflight that scans a Zimbra source system for THREE categories of broken       #
+# Description     : Operator preflight that scans a Zimbra source system for FOUR categories of broken        #
 #                   shares.  Produces CSV reports plus reviewable removal scripts.  Read-only by itself;      #
 #                   cleanup only happens when the operator chooses to execute the generated removal scripts.  #
 #                                                                                                             #
 # Usage           : MCE_OP2_broken_shares_checker.sh [--jobs N] [--delay SEC]                                 #
 #                                                   [--timeout SEC] [--output-dir DIR] [-h]                   #
-# Last Updated    : 15 Jun 2026 (v2.2.0 - flag orphaned/zombie mountpoints whose owner account was deleted)   #
+# Last Updated    : 12 Aug 2026 (v2.3.0 - Part 4: stale ACCEPTANCE records -- live grant, no live mountpoint) #
 #                                                                                                             #
 # Why this exists :                                                                                           #
 #   Broken shares accumulate over time on any long-running Zimbra system as users are added/removed,          #
@@ -36,10 +36,20 @@
 #      by reading each user's zimbraSharedItem and cross-referencing every entry against the live folder      #
 #      ACL via `zmmailbox gfg <folder>` on the owner's mailbox.  A zimbraSharedItem entry whose grantee is    #
 #      not present in the matching folder's actual ACL is flagged stale.                                      #
+#   4. STALE ACCEPTANCE records (zimbraSharedItem outliving the grantee's mountpoint).  v2.3.0.  Entries      #
+#      whose grant IS live on the folder ACL, but whose grantee no longer has a mountpoint to that folder     #
+#      -- the grantee accepted the share once and later deleted the mountpoint, or accepted twice under       #
+#      different identities (alias / renamed epochs), leaving duplicate acceptance records.  zimbraSharedItem #
+#      is an acceptance LEDGER, not a live-mount list, so these records survive indefinitely.  At migration   #
+#      restore time each one recreates a mountpoint the user deleted (or a duplicate) on the destination --   #
+#      valid but unwanted clutter.  Detected by cross-referencing every live-grant ledger record against      #
+#      the grantee's actual mountpoints (owner zimbraId + remote folder id, harvested during the Part 1       #
+#      folder-tree scan).  Conservative: records are only flagged when the grantee's folder tree was          #
+#      successfully scanned and the record carries a matchable folderId.                                      #
 #                                                                                                             #
 # Output          :                                                                                           #
-#   - 3 CSV reports (INBOUND mount points, OUTBOUND grants, STALE ACL entries)                                #
-#   - 3 removal scripts (review and execute manually if appropriate)                                          #
+#   - 4 CSV reports (INBOUND mount points, OUTBOUND grants, STALE ACL entries, STALE ACCEPTANCE records)      #
+#   - 4 removal scripts (review and execute manually if appropriate)                                          #
 #   - 1 unified log file                                                                                      #
 #   - 1 skipped-accounts file (accounts excluded by the reachability probe)                                   #
 #   All output files go to the --output-dir (default /var/tmp/) with a timestamp suffix.                      #
@@ -79,7 +89,7 @@ export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 
 # Script version
-VERSION="2.2.0"
+VERSION="2.3.0"
 
 # ---------------------------------------------------------------------------
 # Defaults (overridable via CLI flags parsed in parse_args)
@@ -111,6 +121,16 @@ SKIPPED_ACCOUNTS_FILE=""
 # v2.0.0: stale-ACL detection (Bug C)
 STALE_ACL_CSV=""
 STALE_ACL_SCRIPT=""
+# v2.3.0: stale-ACCEPTANCE detection (Part 4)
+STALE_ACCEPT_CSV=""
+STALE_ACCEPT_SCRIPT=""
+# v2.3.0: cross-part hand-off files (created in main scope because the check
+# functions run inside $(...) command substitutions -- variables they set do
+# not survive, files they write do)
+MOUNTS_FILE=""          # every <link> seen in Part 1: grantee, zid, rid, broken flag
+SCANNED_FILE=""         # users whose Part 1 folder-tree fetch SUCCEEDED
+LEDGER_RAW_FILE=""      # Part 3 -> Part 4: flagged stale-acceptance records (TSV)
+LEDGER_UNMATCH_FILE=""  # Part 3 -> Part 4: records skipped as unmatchable
 
 # Color codes (only enabled when stdout is a TTY)
 if [[ -t 1 ]]; then
@@ -197,9 +217,11 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") [options]
 
-Scans the local Zimbra source for broken inbound mountpoints and broken
-outbound share grants.  Run as the zimbra user on a mailbox server BEFORE
-running MissionCriticalEmail_Backup-Restore in pre/full mode.
+Scans the local Zimbra source for four classes of broken share state:
+broken inbound mountpoints, broken outbound share grants, stale ACL
+entries, and stale acceptance records (live grant, no live mountpoint).
+Run as the zimbra user on a mailbox server BEFORE running
+MissionCriticalEmail_Backup-Restore in pre/full mode.
 
 Options:
   --jobs N              Parallel jobs for the reachability probe phase
@@ -299,6 +321,9 @@ parse_args() {
     # v2.0.0: stale-ACL detection (Bug C)
     STALE_ACL_CSV="${OUTPUT_DIR}/stale-acl-shares-${TIMESTAMP}.csv"
     STALE_ACL_SCRIPT="${OUTPUT_DIR}/remove-stale-acl-shares-${TIMESTAMP}.sh"
+    # v2.3.0: stale-ACCEPTANCE detection (Part 4)
+    STALE_ACCEPT_CSV="${OUTPUT_DIR}/stale-acceptance-shares-${TIMESTAMP}.csv"
+    STALE_ACCEPT_SCRIPT="${OUTPUT_DIR}/remove-stale-acceptance-shares-${TIMESTAMP}.sh"
 }
 
 ################################################################################
@@ -554,11 +579,16 @@ get_all_active_users() {
 #   emits a structured TSV result on stdout:
 #       BROKEN<TAB>email<TAB>folder_id<TAB>abs_path<TAB>folder_name
 #         (one line per broken folder; user may have many)
+#       MOUNT<TAB>email<TAB>link_id<TAB>abs_path<TAB>name<TAB>owner_zid<TAB>rid<TAB>broken_flag
+#         (v2.3.0: EVERY <link> in the tree, broken or not; broken_flag 0/1.
+#          Feeds both the v2.2.0 zombie-owner check and Part 4's live-mount map.)
+#       SCANNED<TAB>email
+#         (v2.3.0: fetch succeeded -- this user's MOUNT rows are complete.
+#          Part 4 only evaluates ledger records whose grantee was scanned.)
 #       TIMEOUT<TAB>email
 #         (zmsoap timed out twice)
 #       ERROR<TAB>email
 #         (non-timeout zmsoap failure)
-#   No output = user has no broken mountpoints (clean).
 #
 #   Reads ZMSOAP_TIMEOUT from the environment (parent must export it).
 ################################################################################
@@ -591,6 +621,11 @@ check_one_account_inbound() {
         return 0
     done
 
+    # v2.3.0: fetch succeeded -- record that this user's mount inventory below
+    # is authoritative (Part 4 must not judge ledger records against a user
+    # whose tree we never saw).
+    printf 'SCANNED\t%s\n' "$user_email"
+
     # Parse broken folders from the XML response
     if echo "$folder_data" | grep -q 'broken="1"'; then
         local line folder_id abs_path folder_name
@@ -619,20 +654,27 @@ check_one_account_inbound() {
     # v2.2.0: orphaned-mountpoint ("zombie") candidates.  A mountpoint whose OWNER
     # ACCOUNT was deleted is a <link> whose owner zimbraId (zid) no longer resolves
     # -- and Zimbra frequently does NOT set broken="1" on it, so the scan above
-    # misses it.  Emit each non-broken mountpoint <link> with its owner zid; the
-    # PARENT resolves the zid against LDAP and flags the unresolvable ones (LDAP
+    # misses it.  Emit each mountpoint <link> with its owner zid; the PARENT
+    # resolves the zid against LDAP and flags the unresolvable ones (LDAP
     # lookups are kept out of the parallel worker).  Lookbehind on the leading
     # space isolates the link's own id/name from rid="/zid="/oname=".
-    local link_id link_path link_name link_zid
+    # v2.3.0: ALL links are emitted (broken ones carry broken_flag=1 -- the
+    # zombie pass skips those, but Part 4's live-mount map needs the complete
+    # inventory), and the owner-side remote folder id (rid) rides along.
+    local link_id link_path link_name link_zid link_rid link_broken
     while read -r line; do
         link_zid=$(echo "$line" | grep -oP 'zid="\K[^"]+' || true)
         [[ -z "$link_zid" ]] && continue
         link_id=$(echo "$line"   | grep -oP '(?<= )id="\K[^"]+' || true)
         link_path=$(echo "$line" | grep -oP 'absFolderPath="\K[^"]+' || true)
         link_name=$(echo "$line" | grep -oP '(?<= )name="\K[^"]+' || true)
-        [[ -n "$link_id" ]] && printf 'MOUNT\t%s\t%s\t%s\t%s\t%s\n' \
-            "$user_email" "$link_id" "$link_path" "$link_name" "$link_zid"
-    done < <(echo "$folder_data" | grep '<link ' | grep -v 'broken="1"')
+        link_rid=$(echo "$line"  | grep -oP 'rid="\K[^"]+' || true)
+        link_broken=0
+        [[ "$line" == *'broken="1"'* ]] && link_broken=1
+        [[ -n "$link_id" ]] && printf 'MOUNT\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$user_email" "$link_id" "$link_path" "$link_name" "$link_zid" \
+            "$link_rid" "$link_broken"
+    done < <(echo "$folder_data" | grep '<link ')
 
     return 0
 }
@@ -768,10 +810,17 @@ SCRIPT_HEADER
     # zid and resolve each once against LDAP; a zid that does NOT resolve means the
     # owner account was deleted -> the mountpoint is an orphaned "zombie" the
     # broken="1" scan cannot see.  Flag them into the same CSV + removal script.
+    # v2.3.0: persist the complete link inventory + scanned-user set for
+    # Part 4's live-mount cross-reference (files outlive this subshell).
+    awk -F'\t' '$1 == "MOUNT"' "$inbound_results" > "$MOUNTS_FILE"
+    awk -F'\t' '$1 == "SCANNED" {print tolower($2)}' "$inbound_results" | sort -u > "$SCANNED_FILE"
+
+    # Zombie pass considers only NON-broken links ($8 == 0): broken="1" links
+    # are already flagged by the broken scan above.
     local sorted_mounts orphan_total=0
     declare -A zid_unresolved=() orphan_email_seen=()
     sorted_mounts=$(mktemp)
-    awk -F'\t' '$1 == "MOUNT"' "$inbound_results" | sort -t$'\t' -k2,2 > "$sorted_mounts"
+    awk -F'\t' '$1 == "MOUNT" && $8 == "0"' "$inbound_results" | sort -t$'\t' -k2,2 > "$sorted_mounts"
     if [[ -s "$sorted_mounts" ]]; then
         local z
         while IFS= read -r z; do
@@ -779,8 +828,8 @@ SCRIPT_HEADER
             [[ "$(resolve_grantee_id_to_email "$z")" == "UNRESOLVED" ]] && zid_unresolved["$z"]=1
         done < <(awk -F'\t' '{print $6}' "$sorted_mounts" | sort -u)
 
-        local m_email m_id m_path m_name m_zid m_path_esc m_name_esc
-        while IFS=$'\t' read -r _ m_email m_id m_path m_name m_zid; do
+        local m_email m_id m_path m_name m_zid m_rid m_broken m_path_esc m_name_esc
+        while IFS=$'\t' read -r _ m_email m_id m_path m_name m_zid m_rid m_broken; do
             [[ -n "${zid_unresolved[$m_zid]:-}" ]] || continue
             m_path_esc="${m_path//\"/\"\"}"
             m_name_esc="${m_name//\"/\"\"}"
@@ -857,6 +906,33 @@ resolve_grantee_id_to_email() {
 
     if [[ -n "$resolved_email" ]] && [[ "$resolved_email" =~ @ ]]; then
         echo "$resolved_email"
+    else
+        echo "UNRESOLVED"
+    fi
+    return 0
+}
+
+# Function: resolve_email_to_zid  (v2.3.0)
+# Returns the account's zimbraId, or the sentinel "UNRESOLVED".  Same
+# subshell-safe sentinel pattern as resolve_grantee_id_to_email (v1.3.4).
+resolve_email_to_zid() {
+    local email="$1"
+
+    local zid
+    zid=$(ldapsearch -x -H "$LDAP_MASTER_URL" \
+        -D "$LDAP_BIND_DN" \
+        -w "$ZIMBRA_LDAP_PASSWORD" \
+        -LLL \
+        -o ldif-wrap=no \
+        "(&(objectClass=zimbraAccount)(mail=$email))" \
+        zimbraId 2>/dev/null | \
+        grep "^zimbraId: " | \
+        head -n 1 | \
+        awk '{print $2}' | \
+        tr -d '\n' || true)
+
+    if [[ -n "$zid" ]]; then
+        echo "$zid"
     else
         echo "UNRESOLVED"
     fi
@@ -1163,6 +1239,26 @@ SCRIPT_HEADER
     local total_stale=0
     local users_with_stale=0
 
+    # v2.3.0 (Part 4 feed): live-mount map from Part 1's link inventory.
+    # Key = ownerZid|rid|granteeEmail(lowercase) -> present.  Broken links
+    # count as "present" -- Part 1 flags those; Part 4 only flags records
+    # whose mountpoint is truly ABSENT.
+    declare -A live_mounts=()
+    declare -A scanned_users=()
+    if [[ -s "$MOUNTS_FILE" ]]; then
+        local mm_email mm_zid mm_rid
+        while IFS=$'\t' read -r _ mm_email _ _ _ mm_zid mm_rid _; do
+            [[ -z "$mm_zid" || -z "$mm_rid" ]] && continue
+            live_mounts["${mm_zid}|${mm_rid}|${mm_email,,}"]=1
+        done < "$MOUNTS_FILE"
+    fi
+    if [[ -s "$SCANNED_FILE" ]]; then
+        local su
+        while IFS= read -r su; do
+            [[ -n "$su" ]] && scanned_users["$su"]=1
+        done < "$SCANNED_FILE"
+    fi
+
     while IFS= read -r user_email || [[ -n "$user_email" ]]; do
         current_user=$((current_user + 1))
 
@@ -1182,16 +1278,18 @@ SCRIPT_HEADER
         declare -A expected_keys=()
         declare -A folder_set=()
         declare -A item_by_key=()
+        declare -A item_fid_by_key=()
         while IFS= read -r shared_item; do
             [[ -z "$shared_item" ]] && continue
-            local fp gn gi gt rights
-            fp=""; gn=""; gi=""; gt=""; rights=""
+            local fp gn gi gt rights fid
+            fp=""; gn=""; gi=""; gt=""; rights=""; fid=""
             IFS=';' read -ra pairs <<< "$shared_item"
             for pair in "${pairs[@]}"; do
                 local k="${pair%%:*}"
                 local v="${pair#*:}"
                 case "$k" in
                     folderPath)  fp="$v" ;;
+                    folderId)    fid="$v" ;;
                     granteeName) gn="$v" ;;
                     granteeId)   gi="$v" ;;
                     granteeType) gt="$v" ;;
@@ -1216,9 +1314,14 @@ SCRIPT_HEADER
             expected_keys["$key"]="$rights"
             folder_set["$fp"]=1
             item_by_key["$key"]="$shared_item"
+            item_fid_by_key["$key"]="$fid"
         done <<< "$share_data"
 
         [[ ${#expected_keys[@]} -eq 0 ]] && continue
+
+        # v2.3.0 (Part 4 feed): the owner's zimbraId keys the live-mount map.
+        local owner_zid
+        owner_zid=$(resolve_email_to_zid "$user_email")
 
         # v2.0.2: Per-folder gfg calls.  v2.0.1 batched all of a user's
         # gfg commands into one zmmailbox session and aligned each output
@@ -1304,6 +1407,22 @@ SCRIPT_HEADER
                 } >> "$STALE_ACL_SCRIPT"
 
                 user_stale_count=$((user_stale_count + 1))
+            else
+                # v2.3.0 (Part 4 feed): the grant IS live -- cross-reference the
+                # acceptance record against the grantee's actual mountpoints.
+                # Conservative: only judged when the grantee's tree was scanned
+                # in Part 1 AND the record carries a folderId AND the owner's
+                # zid resolved; everything else is recorded as unmatchable.
+                local g_low="${key##*|}"
+                g_low="${g_low,,}"
+                local a_fid="${item_fid_by_key[$key]:-}"
+                if [[ "$owner_zid" == "UNRESOLVED" || -z "$a_fid" || -z "${scanned_users[$g_low]:-}" ]]; then
+                    printf '%s\t%s\t%s\n' "$user_email" "${key%|*}" "${key##*|}" >> "$LEDGER_UNMATCH_FILE"
+                elif [[ -z "${live_mounts[${owner_zid}|${a_fid}|${g_low}]:-}" ]]; then
+                    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                        "$user_email" "${key%|*}" "${key##*|}" "$a_fid" \
+                        "${expected_keys[$key]}" "${item_by_key[$key]}" >> "$LEDGER_RAW_FILE"
+                fi
             fi
         done
 
@@ -1326,6 +1445,112 @@ SCRIPT_HEADER
 }
 
 ################################################################################
+# Function: check_stale_acceptance_records  (v2.3.0 -- Part 4)
+# Description:
+#   Formats and reports the stale-ACCEPTANCE records collected during Part 3's
+#   pass (LEDGER_RAW_FILE): zimbraSharedItem entries whose grant is live on
+#   the folder ACL but whose grantee no longer has a mountpoint to the folder.
+#   These are acceptance-ledger residue -- the grantee accepted once and later
+#   deleted the mountpoint (or re-accepted under another identity).  Left in
+#   place, a migration restore recreates each one as an unwanted mountpoint on
+#   the destination (valid, user-deletable, but clutter and helpdesk noise).
+#
+#   Removing the record does NOT revoke the share: the folder ACL grant is
+#   untouched and the grantee can re-accept at any time.
+#
+#   The detection work happens in Part 3 (which already parses the ledger and
+#   confirms live grants) against the live-mount inventory harvested by
+#   Part 1's folder-tree scan -- this function only formats CSV + removal
+#   script and reports the counts, including how many live-grant records
+#   could NOT be judged (grantee tree unscanned, missing folderId, owner zid
+#   unresolved) so nothing is silently skipped.
+################################################################################
+check_stale_acceptance_records() {
+    log_message INFO ""
+    log_message INFO "========================================"
+    log_message INFO "PART 4: STALE ACCEPTANCE RECORDS"
+    log_message INFO "========================================"
+    log_message INFO "Reporting live-grant zimbraSharedItem entries whose grantee has no live mountpoint..."
+    log_message INFO ""
+
+    echo "OwnerEmail,FolderPath,GranteeEmail,FolderId,Permissions" > "$STALE_ACCEPT_CSV"
+
+    cat > "$STALE_ACCEPT_SCRIPT" << 'SCRIPT_HEADER'
+#!/bin/bash
+################################################################################
+# Generated script to remove STALE ACCEPTANCE zimbraSharedItem entries (Part 4)
+#
+# Each entry below has a LIVE grant on the folder ACL, but its grantee no
+# longer has a mountpoint to the folder (deleted after acceptance, or an
+# older duplicate acceptance).  Removing the entry does NOT revoke the
+# share -- the folder ACL grant is untouched and the grantee can re-accept
+# at any time.  It only stops the stale acceptance from being carried
+# forward (e.g. recreated as an unwanted mountpoint by a migration).
+#
+# IMPORTANT: Review carefully before executing.  Run as zimbra user:
+#   su - zimbra -c 'bash /path/to/this/script.sh'
+################################################################################
+
+set -uo pipefail
+
+SCRIPT_HEADER
+    chmod +x "$STALE_ACCEPT_SCRIPT"
+
+    local total_stale=0 users_with_stale=0 unmatchable=0
+    if [[ -s "$LEDGER_UNMATCH_FILE" ]]; then
+        unmatchable=$(wc -l < "$LEDGER_UNMATCH_FILE" | tr -d ' ')
+    fi
+
+    if [[ -s "$LEDGER_RAW_FILE" ]]; then
+        local sorted
+        sorted=$(mktemp)
+        sort -t$'\t' -k1,1 "$LEDGER_RAW_FILE" > "$sorted"
+
+        local last_owner=""
+        local owner fp grantee fid rights shared_item
+        while IFS=$'\t' read -r owner fp grantee fid rights shared_item; do
+            [[ -z "$owner" ]] && continue
+            if [[ "$owner" != "$last_owner" ]]; then
+                users_with_stale=$((users_with_stale + 1))
+                last_owner="$owner"
+            fi
+
+            printf '"%s","%s","%s","%s","%s"\n' \
+                "${owner//\"/\"\"}" "${fp//\"/\"\"}" "${grantee//\"/\"\"}" \
+                "${fid//\"/\"\"}" "${rights//\"/\"\"}" >> "$STALE_ACCEPT_CSV"
+
+            {
+                echo ""
+                echo "# Owner: $owner"
+                echo "# Folder: $fp (folderId $fid)"
+                echo "# Stale acceptance by: $grantee (grant is live; mountpoint is gone)"
+                printf 'echo "Removing stale acceptance record: %s - %s -> %s"\n' \
+                    "$(printf '%q' "$owner")" \
+                    "$(printf '%q' "$fp")" \
+                    "$(printf '%q' "$grantee")"
+                printf 'zmprov ma %s -zimbraSharedItem %s 2>&1 || echo "  [WARNING] Failed to remove share record"\n' \
+                    "$(printf '%q' "$owner")" \
+                    "$(printf '%q' "$shared_item")"
+            } >> "$STALE_ACCEPT_SCRIPT"
+
+            total_stale=$((total_stale + 1))
+        done < "$sorted"
+        rm -f "$sorted"
+    fi
+
+    log_message INFO ""
+    log_message SUCCESS "Stale acceptance check finished"
+    log_message INFO "  Total stale acceptance records: $total_stale"
+    log_message INFO "  Owners affected: $users_with_stale"
+    if [[ $unmatchable -gt 0 ]]; then
+        log_message WARNING "  Live-grant records NOT judged (unmatchable): $unmatchable"
+        log_message WARNING "    (grantee tree unscanned in Part 1, record missing folderId, or owner zid unresolved)"
+    fi
+
+    echo "$total_stale|$users_with_stale|$unmatchable"
+}
+
+################################################################################
 # Function: cleanup
 # Description: Clean up internal temp files on exit (output files are kept).
 ################################################################################
@@ -1334,6 +1559,11 @@ cleanup() {
         rm -f "$USERS_TEMP_FILE"
     fi
     [[ -n "$LDAP_FALLBACK_WARNED_FILE" ]] && rm -f "$LDAP_FALLBACK_WARNED_FILE"
+    # v2.3.0 cross-part hand-off files
+    [[ -n "$MOUNTS_FILE" ]] && rm -f "$MOUNTS_FILE"
+    [[ -n "$SCANNED_FILE" ]] && rm -f "$SCANNED_FILE"
+    [[ -n "$LEDGER_RAW_FILE" ]] && rm -f "$LEDGER_RAW_FILE"
+    [[ -n "$LEDGER_UNMATCH_FILE" ]] && rm -f "$LEDGER_UNMATCH_FILE"
 }
 
 trap cleanup EXIT INT TERM
@@ -1351,10 +1581,12 @@ cat << EOF
   Version ${VERSION}
 ================================================================================
 
-  This script checks for THREE classes of broken shares:
-    1. INBOUND:    Broken mount points in user mailboxes
-    2. OUTBOUND:   Shares granted to non-existent accounts (Bugs A/D/E)
-    3. STALE ACL:  zimbraSharedItem entries with no matching folder ACL (Bug C)
+  This script checks for FOUR classes of broken shares:
+    1. INBOUND:      Broken mount points in user mailboxes
+    2. OUTBOUND:     Shares granted to non-existent accounts (Bugs A/D/E)
+    3. STALE ACL:    zimbraSharedItem entries with no matching folder ACL (Bug C)
+    4. STALE ACCEPT: live-grant zimbraSharedItem entries whose grantee no
+                     longer has a mountpoint (acceptance-ledger residue)
 
   Output directory    : ${OUTPUT_DIR}
   Reachability jobs   : ${PROBE_JOBS}
@@ -1380,6 +1612,13 @@ check_prerequisites
 get_ldap_settings
 users_file=$(get_all_active_users)
 
+# v2.3.0: cross-part hand-off files (main scope -- the check functions run in
+# $(...) subshells, so paths must be minted here for their writes to be shared)
+MOUNTS_FILE=$(mktemp)
+SCANNED_FILE=$(mktemp)
+LEDGER_RAW_FILE=$(mktemp)
+LEDGER_UNMATCH_FILE=$(mktemp)
+
 log_message INFO ""
 log_message INFO "========================================"
 log_message INFO "Starting comprehensive broken shares scan..."
@@ -1396,6 +1635,10 @@ IFS='|' read -r outbound_total outbound_users <<< "$outbound_results"
 # v2.0.0 Part 3: Stale-ACL detection (Bug C)
 stale_results=$(check_outbound_stale_acl_shares "$users_file")
 IFS='|' read -r stale_total stale_users <<< "$stale_results"
+
+# v2.3.0 Part 4: Stale-acceptance detection (ledger vs live mounts)
+accept_results=$(check_stale_acceptance_records)
+IFS='|' read -r accept_total accept_users accept_unmatchable <<< "$accept_results"
 
 rm -f "$users_file"
 USERS_TEMP_FILE=""
@@ -1421,6 +1664,13 @@ log_message INFO "STALE ACL ENTRIES (Bug C):"
 log_message INFO "  Total stale entries: $stale_total"
 log_message INFO "  Users affected: $stale_users"
 log_message INFO ""
+log_message INFO "STALE ACCEPTANCE RECORDS (ledger vs live mounts):"
+log_message INFO "  Total stale acceptance records: $accept_total"
+log_message INFO "  Owners affected: $accept_users"
+if [[ $accept_unmatchable -gt 0 ]]; then
+    log_message WARNING "  Live-grant records not judged (unmatchable): $accept_unmatchable"
+fi
+log_message INFO ""
 log_message INFO "========================================"
 log_message INFO "OUTPUT FILES:"
 log_message INFO "========================================"
@@ -1439,8 +1689,12 @@ log_message INFO "  Stale ACL Entries (Bug C):"
 log_message INFO "    CSV report:     $STALE_ACL_CSV"
 log_message INFO "    Removal script: $STALE_ACL_SCRIPT"
 log_message INFO ""
+log_message INFO "  Stale Acceptance Records (ledger vs live mounts):"
+log_message INFO "    CSV report:     $STALE_ACCEPT_CSV"
+log_message INFO "    Removal script: $STALE_ACCEPT_SCRIPT"
+log_message INFO ""
 
-total_all_broken=$((inbound_total + outbound_total + stale_total))
+total_all_broken=$((inbound_total + outbound_total + stale_total + accept_total))
 
 if [[ $total_all_broken -gt 0 ]]; then
     log_message INFO "========================================"
@@ -1460,6 +1714,9 @@ if [[ $total_all_broken -gt 0 ]]; then
     log_message INFO ""
     log_message INFO "To remove stale ACL entries (Bug C):"
     log_message INFO "  bash $STALE_ACL_SCRIPT"
+    log_message INFO ""
+    log_message INFO "To remove stale acceptance records (ledger vs live mounts):"
+    log_message INFO "  bash $STALE_ACCEPT_SCRIPT"
     log_message INFO ""
     log_message INFO "========================================"
     log_message INFO "Completed at $(date)"
